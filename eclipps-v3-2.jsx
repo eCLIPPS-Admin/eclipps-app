@@ -2602,11 +2602,15 @@ export default function ECLIPPSApp() {
     const userPrompt = `ENGAGEMENT BRIEF:\n${briefLines}\n\nCOMMUNITY DATA:\n${sources}\n\nReturn JSON with keys: summary, noise_note, community_fingerprint {who_they_are, dominant_mood, awareness_stage, sophistication, data_appears}, signal_map [{signal, signal_type, frequency, prioritization_score, what_it_reveals}], sentiment_layers {surface, underlying, trust_level, emotional_drivers[]}, problems {explicit[], implicit[], fears[]}, readiness {community_momentum, ready_for[], not_ready_for[]}, action_orientation {community_engagement[], leadership_options[], preferred_format}, risk_signals [{risk, severity, what_it_means}], opportunity_map {content[], program[], product[], advocacy[], partnership[], resource[]}, lexicon [{phrase, signals}], supporting_resources [{title, source, url, relevance}]`;
 
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/api/generate-report", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, system: systemPrompt, messages: [{ role: "user", content: userPrompt }] })
+        body: JSON.stringify({ systemPrompt, userPrompt })
       });
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => "");
+        throw new Error(`Report generation failed (${res.status}): ${errBody}`);
+      }
       const data = await res.json();
       const raw = data.content?.[0]?.text || "";
       const cleaned = raw.replace(/```json|```/g, "").trim();
@@ -2616,6 +2620,7 @@ export default function ECLIPPSApp() {
       setScreen("workspace"); setTab("report");
     } catch (e) {
       clearInterval(phaseTimer);
+      console.error("Report generation error:", e);
       setErr("Report generation encountered an error. Please check your sources and try again.");
       setScreen("error");
     }
