@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { supabase } from "./supabaseClient";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // eCLIPPS v3 — Community Insights Engine
@@ -6,7 +7,8 @@ import { useState, useRef, useEffect, useCallback } from "react";
 // DO NOT reference Anthropic, Claude, or any AI vendor in user-facing UI.
 // All AI references use "eCLIPPS engine" only.
 // App domain: app.eclipps.io | Marketing: eclipps.io
-// Storage: localStorage (swap for Vercel KV API calls in production)
+// Auth: Supabase Auth + `profiles` table (RLS-enforced). No hardcoded/seeded admin.
+// Storage: localStorage still used for sessions/archives/tickets pending Supabase migration.
 // Payments: Stripe webhooks provision/suspend accounts by tier
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -200,17 +202,6 @@ const fileExt=(n)=>({txt:"📄",csv:"📊",json:"📋",pdf:"📕",md:"📝"}[n.s
 const mcColor=(v)=>v==="hot"?T.green:v==="warm"?T.amber:T.red;
 const rtfEsc=(s="")=>String(s).replace(/\\/g,"\\\\").replace(/\{/g,"\\{").replace(/\}/g,"\\}");
 
-// Simple hash (prototype — use bcrypt server-side in production)
-const simpleHash = (str) => {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    const char = str.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
-  }
-  return hash.toString(36);
-};
-
 // ── Storage Layer ─────────────────────────────────────────────────────────────
 // NOTE: In production, replace these localStorage calls with
 // fetch() calls to your Vercel KV API endpoints.
@@ -226,28 +217,31 @@ const sSet = (key, val) => {
 };
 const sDel = (key) => { try { localStorage.removeItem(key); } catch {} };
 
-// ── Auth Storage Helpers ──────────────────────────────────────────────────────
-const getUsers = () => sGet("eclipps_users", {});
-const saveUsers = (users) => sSet("eclipps_users", users);
-const getCurrentUser = () => sGet("eclipps_current_user", null);
-const saveCurrentUser = (user) => sSet("eclipps_current_user", user);
-const clearCurrentUser = () => sDel("eclipps_current_user");
+// ── Auth ─────────────────────────────────────────────────────────────────────
+// Real auth now lives in Supabase Auth + the `profiles` table (see supabaseClient.js).
+// There is no seeded admin account and no client-side password storage of any kind.
+// A user's role/tier is read from their `profiles` row, and only an existing admin
+// (via direct DB access or the future Admin panel) can change role/tier — enforced
+// by Postgres RLS + trigger, not by frontend code.
 
-// Seed admin account if none exists
-const seedAdmin = () => {
-  const users = getUsers();
-  if (!users["admin"]) {
-    users["admin"] = {
-      id: "admin",
-      username: "admin",
-      passwordHash: simpleHash("eclipps2026"),
-      tier: "admin",
-      email: "admin@eclipps.io",
-      createdAt: todayISO(),
-      status: "active",
-    };
-    saveUsers(users);
-  }
+// Fetch the profile row for a Supabase auth user and shape it into the
+// user object the rest of this app expects (id, username, email, tier, role, status).
+const fetchProfile = async (authUser) => {
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("*")
+    .eq("user_id", authUser.id)
+    .single();
+  if (error || !data) return null;
+  return {
+    id: data.user_id,
+    username: data.display_name || (data.email || "").split("@")[0],
+    email: data.email,
+    tier: data.tier_key,
+    role: data.role,
+    status: data.status,
+    createdAt: (data.created_at || "").split("T")[0],
+  };
 };
 
 // ── Session / Archive Storage ─────────────────────────────────────────────────
@@ -597,47 +591,67 @@ function HIPAAModal({ onConfirm, onCancel }) {
 // ── Login Screen ──────────────────────────────────────────────────────────────
 function LoginScreen({ onLogin }) {
   const [mode, setMode] = useState("login"); // login | register
-  const [username, setUsername] = useState("");
+  const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [err, setErr] = useState("");
+  const [info, setInfo] = useState("");
   const [loading, setLoading] = useState(false);
 
-  const handleLogin = () => {
-    setErr(""); setLoading(true);
-    setTimeout(() => {
-      const users = getUsers();
-      const user = users[username.toLowerCase()];
-      if (!user || user.passwordHash !== simpleHash(password)) {
-        setErr("Invalid username or password."); setLoading(false); return;
-      }
-      if (user.status === "suspended") {
-        setErr("Your subscription is inactive. Please update your payment method at eclipps.io/billing to restore access."); setLoading(false); return;
-      }
-      saveCurrentUser(user);
-      onLogin(user);
+  const handleLogin = async () => {
+    setErr(""); setInfo(""); setLoading(true);
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: email.trim().toLowerCase(),
+      password,
+    });
+    if (error) {
+      setErr(error.message === "Invalid login credentials" ? "Invalid email or password." : error.message);
       setLoading(false);
-    }, 400);
+      return;
+    }
+    const profile = await fetchProfile(data.user);
+    if (!profile) {
+      setErr("Signed in, but no profile record was found. Contact support.");
+      setLoading(false);
+      return;
+    }
+    if (profile.status === "suspended") {
+      setErr("Your subscription is inactive. Please update your payment method at eclipps.io/billing to restore access.");
+      await supabase.auth.signOut();
+      setLoading(false);
+      return;
+    }
+    onLogin(profile);
+    setLoading(false);
   };
 
-  const handleRegister = () => {
-    setErr("");
-    if (!username.trim() || !email.trim() || !password.trim()) { setErr("All fields are required."); return; }
+  const handleRegister = async () => {
+    setErr(""); setInfo("");
+    if (!email.trim() || !password.trim()) { setErr("Email and password are required."); return; }
     if (password !== confirm) { setErr("Passwords do not match."); return; }
     if (password.length < 6) { setErr("Password must be at least 6 characters."); return; }
-    const users = getUsers();
-    const key = username.toLowerCase();
-    if (users[key]) { setErr("That username is already taken."); return; }
     setLoading(true);
-    setTimeout(() => {
-      const newUser = { id: genId(), username: key, email, passwordHash: simpleHash(password), tier: "free", status: "active", createdAt: todayISO() };
-      users[key] = newUser;
-      saveUsers(users);
-      saveCurrentUser(newUser);
-      onLogin(newUser);
+    const { data, error } = await supabase.auth.signUp({
+      email: email.trim().toLowerCase(),
+      password,
+      options: { data: { display_name: displayName.trim() || email.split("@")[0] } },
+    });
+    if (error) {
+      setErr(error.message);
       setLoading(false);
-    }, 400);
+      return;
+    }
+    // If email confirmation is required, there's no session yet.
+    if (!data.session) {
+      setInfo("Account created. Check your email to confirm your address, then sign in.");
+      setMode("login");
+      setLoading(false);
+      return;
+    }
+    const profile = await fetchProfile(data.user);
+    if (profile) onLogin(profile);
+    setLoading(false);
   };
 
   const inp = (val, set, ph, type = "text") => (
@@ -666,12 +680,12 @@ function LoginScreen({ onLogin }) {
 
         {mode === "login" ? (
           <>
-            {inp(username, setUsername, "Username")}
+            {inp(email, setEmail, "Email address", "email")}
             {inp(password, setPassword, "Password", "password")}
           </>
         ) : (
           <>
-            {inp(username, setUsername, "Choose a username")}
+            {inp(displayName, setDisplayName, "Your name (optional)")}
             {inp(email, setEmail, "Email address", "email")}
             {inp(password, setPassword, "Password (min 6 chars)", "password")}
             {inp(confirm, setConfirm, "Confirm password", "password")}
@@ -681,6 +695,7 @@ function LoginScreen({ onLogin }) {
           </>
         )}
 
+        {info && <div style={{ background: T.cyan + "15", border: `1px solid ${T.cyan}40`, borderRadius: 8, padding: "9px 12px", fontSize: 13, color: T.cyan, marginBottom: 12 }}>{info}</div>}
         {err && <div style={{ background: T.red + "15", border: `1px solid ${T.red}40`, borderRadius: 8, padding: "9px 12px", fontSize: 13, color: T.red, marginBottom: 12 }}>⚠ {err}</div>}
 
         <Btn onClick={mode === "login" ? handleLogin : handleRegister} disabled={loading} color={T.cyan} style={{ width: "100%", padding: "13px", fontSize: 15 }}>
@@ -1483,10 +1498,11 @@ function SettingsTab({ ag, setAg, user, onPasswordChange }) {
   const [confirmPw, setConfirmPw] = useState("");
   const [pwMsg, setPwMsg] = useState("");
 
-  const handlePwChange = () => {
+  const handlePwChange = async () => {
     if (newPw.length < 6) { setPwMsg("Password must be at least 6 characters."); return; }
     if (newPw !== confirmPw) { setPwMsg("Passwords do not match."); return; }
-    onPasswordChange(newPw);
+    const result = await onPasswordChange(newPw);
+    if (result?.error) { setPwMsg(result.error); return; }
     setPwMsg("Password updated successfully.");
     setNewPw(""); setConfirmPw("");
   };
@@ -2103,29 +2119,35 @@ function UserGuideTab({ user }) {
 
 // ── Admin Tab ─────────────────────────────────────────────────────────────────
 function AdminTab({ currentUser }) {
-  const [view, setView] = useState("subscribers"); // subscribers | tickets | credentials
-  const [users, setUsers] = useState({});
+  const [view, setView] = useState("subscribers"); // subscribers | tickets
+  const [users, setUsers] = useState([]);
   const [tickets, setTickets] = useState([]);
-  const [newPw, setNewPw] = useState("");
-  const [confirmPw, setConfirmPw] = useState("");
-  const [pwMsg, setPwMsg] = useState("");
   const [selTicket, setSelTicket] = useState(null);
+  const [resetMsg, setResetMsg] = useState("");
 
-  useEffect(() => { setUsers(getUsers()); setTickets(getTickets()); }, [view]);
+  const loadUsers = async () => {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (!error && data) setUsers(data);
+  };
 
-  const updateUserTier = (username, tier) => {
-    const updated = { ...users, [username]: { ...users[username], tier } };
-    saveUsers(updated); setUsers(updated);
+  useEffect(() => { loadUsers(); setTickets(getTickets()); }, [view]);
+
+  const updateUserTier = async (userId, tier_key) => {
+    const { error } = await supabase.from("profiles").update({ tier_key }).eq("user_id", userId);
+    if (!error) loadUsers();
   };
-  const updateUserStatus = (username, status) => {
-    const updated = { ...users, [username]: { ...users[username], status } };
-    saveUsers(updated); setUsers(updated);
+  const updateUserStatus = async (userId, status) => {
+    const { error } = await supabase.from("profiles").update({ status }).eq("user_id", userId);
+    if (!error) loadUsers();
   };
-  const handleAdminPwChange = () => {
-    if (newPw.length < 6) { setPwMsg("Min 6 characters."); return; }
-    if (newPw !== confirmPw) { setPwMsg("Passwords do not match."); return; }
-    const updated = { ...users, admin: { ...users.admin, passwordHash: simpleHash(newPw) } };
-    saveUsers(updated); setUsers(updated); setPwMsg("Admin password updated."); setNewPw(""); setConfirmPw("");
+  // Admin can trigger a password reset email for any user without ever seeing their password.
+  const sendPasswordReset = async (email) => {
+    setResetMsg("");
+    const { error } = await supabase.auth.resetPasswordForEmail(email);
+    setResetMsg(error ? `Failed to send reset email: ${error.message}` : `Password reset email sent to ${email}.`);
   };
 
   const tierOptions = Object.entries(TIERS).filter(([k]) => k !== "admin").map(([k, v]) => ({ id: k, label: v.label }));
@@ -2137,7 +2159,7 @@ function AdminTab({ currentUser }) {
     </button>
   );
 
-  const userList = Object.values(users).filter(u => u.tier !== "admin");
+  const userList = users.filter(u => u.role !== "admin");
 
   return (
     <div style={{ maxWidth: 760 }}>
@@ -2149,31 +2171,32 @@ function AdminTab({ currentUser }) {
       <div style={{ display: "flex", gap: 4, background: T.dim, borderRadius: 10, padding: 4, marginBottom: 24 }}>
         {navBtn("subscribers", `Subscribers (${userList.length})`)}
         {navBtn("tickets", `Support Tickets (${tickets.filter(t => t.status === "open").length} open)`)}
-        {navBtn("credentials", "Admin Credentials")}
       </div>
+
+      {resetMsg && <div style={{ fontSize: 12, color: resetMsg.startsWith("Failed") ? T.red : T.green, marginBottom: 16 }}>{resetMsg}</div>}
 
       {view === "subscribers" && (
         <div>
-          {userList.length === 0 && <Card><p style={{ color: T.muted, fontSize: 14 }}>No subscribers yet. Accounts are created automatically when Stripe confirms payment.</p></Card>}
+          {userList.length === 0 && <Card><p style={{ color: T.muted, fontSize: 14 }}>No subscribers yet. Accounts are created when someone signs up or Stripe confirms payment.</p></Card>}
           {userList.map(u => (
-            <div key={u.id} style={{ background: T.surface, border: `1px solid ${u.status === "suspended" ? T.red + "40" : T.border}`, borderRadius: 12, padding: "14px 16px", marginBottom: 10, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+            <div key={u.user_id} style={{ background: T.surface, border: `1px solid ${u.status === "suspended" ? T.red + "40" : T.border}`, borderRadius: 12, padding: "14px 16px", marginBottom: 10, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
               <div style={{ flex: 1, minWidth: 160 }}>
-                <div style={{ fontSize: 14, fontWeight: 500, color: T.text, marginBottom: 2 }}>{u.username}</div>
-                <div style={{ fontSize: 11, color: T.muted }}>{u.email} · Joined {u.createdAt}</div>
+                <div style={{ fontSize: 14, fontWeight: 500, color: T.text, marginBottom: 2 }}>{u.display_name || u.email}</div>
+                <div style={{ fontSize: 11, color: T.muted }}>{u.email} · Joined {(u.created_at || "").split("T")[0]}</div>
               </div>
-              <TierBadge tier={u.tier} />
+              <TierBadge tier={u.tier_key} />
               <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                <select value={u.tier} onChange={e => updateUserTier(u.username, e.target.value)}
+                <select value={u.tier_key} onChange={e => updateUserTier(u.user_id, e.target.value)}
                   style={{ background: T.bg, border: `1px solid ${T.border}`, borderRadius: 6, padding: "5px 8px", color: T.text, fontSize: 12, cursor: "pointer" }}>
                   {tierOptions.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
                 </select>
-                <button onClick={() => updateUserStatus(u.username, u.status === "active" ? "suspended" : "active")}
+                <button onClick={() => updateUserStatus(u.user_id, u.status === "active" ? "suspended" : "active")}
                   style={{ padding: "5px 10px", borderRadius: 6, border: `1px solid ${u.status === "active" ? T.red + "60" : T.green + "60"}`, background: "none", color: u.status === "active" ? T.red : T.green, fontSize: 11, cursor: "pointer" }}>
                   {u.status === "active" ? "Suspend" : "Reactivate"}
                 </button>
-                <button onClick={() => { window.open(`?viewAs=${u.username}`, "_blank"); }}
+                <button onClick={() => sendPasswordReset(u.email)}
                   style={{ padding: "5px 10px", borderRadius: 6, border: `1px solid ${T.border}`, background: "none", color: T.muted, fontSize: 11, cursor: "pointer" }}>
-                  View Library
+                  Send Password Reset
                 </button>
               </div>
             </div>
@@ -2209,21 +2232,7 @@ function AdminTab({ currentUser }) {
         </div>
       )}
 
-      {view === "credentials" && (
-        <Card>
-          <SecHead color={T.red}>Admin Password Reset</SecHead>
-          <p style={{ fontSize: 13, color: T.muted, marginBottom: 16 }}>Change the admin account password. You will remain logged in after changing.</p>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 16px" }}>
-            <FInput label="New Password" value={newPw} onChange={setNewPw} placeholder="Min 6 characters" />
-            <FInput label="Confirm Password" value={confirmPw} onChange={setConfirmPw} placeholder="Repeat new password" />
-          </div>
-          {pwMsg && <div style={{ fontSize: 12, color: pwMsg.includes("updated") ? T.green : T.red, marginBottom: 12 }}>{pwMsg}</div>}
-          <Btn onClick={handleAdminPwChange} color={T.red}>Update Admin Password</Btn>
-          <div style={{ marginTop: 24, padding: "14px", background: T.dim, borderRadius: 10, fontSize: 12, color: T.muted, lineHeight: 1.65 }}>
-            <strong style={{ color: T.text }}>Production note:</strong> In a deployed environment, store credentials in Vercel KV and use proper server-side password hashing (bcrypt). The current implementation uses client-side hashing suitable for prototyping only.
-          </div>
-        </Card>
-      )}
+      {view === "credentials" && null}
     </div>
   );
 }
@@ -2499,17 +2508,27 @@ export default function ECLIPPSApp() {
   const [upgradeModal, setUpgradeModal] = useState(null);
   const [longitudinalIds, setLongitudinalIds] = useState(null);
 
-  // ── Init ──
+  // ── Init: restore Supabase session on load, and stay in sync with auth state ──
   useEffect(() => {
-    seedAdmin();
-    const saved = getCurrentUser();
-    if (saved) {
-      const users = getUsers();
-      const fresh = users[saved.username];
-      if (fresh && fresh.status !== "suspended") { setUser(fresh); }
-      else { clearCurrentUser(); }
-    }
-    setAuthReady(true);
+    let active = true;
+
+    const restore = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.user && active) {
+        const profile = await fetchProfile(session.user);
+        if (profile && profile.status !== "suspended" && active) setUser(profile);
+      }
+      if (active) setAuthReady(true);
+    };
+    restore();
+
+    const { data: listener } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      if (!session?.user) { setUser(null); return; }
+      const profile = await fetchProfile(session.user);
+      if (profile && profile.status !== "suspended") setUser(profile);
+    });
+
+    return () => { active = false; listener.subscription.unsubscribe(); };
   }, []);
 
   // ── Load user data after login ──
@@ -2565,13 +2584,10 @@ export default function ECLIPPSApp() {
 
   // ── Auth handlers ──
   const handleLogin = (u) => { setUser(u); };
-  const handleLogout = () => { clearCurrentUser(); setUser(null); setSession(null); setTab("home"); };
-  const handlePasswordChange = (newPw) => {
-    const users = getUsers();
-    users[user.username] = { ...users[user.username], passwordHash: simpleHash(newPw) };
-    saveUsers(users);
-    const updated = { ...user, passwordHash: simpleHash(newPw) };
-    saveCurrentUser(updated); setUser(updated);
+  const handleLogout = async () => { await supabase.auth.signOut(); setUser(null); setSession(null); setTab("home"); };
+  const handlePasswordChange = async (newPw) => {
+    const { error } = await supabase.auth.updateUser({ password: newPw });
+    return error ? { error: error.message } : { error: null };
   };
 
   // ── Session handlers ──
@@ -2602,15 +2618,11 @@ export default function ECLIPPSApp() {
     const userPrompt = `ENGAGEMENT BRIEF:\n${briefLines}\n\nCOMMUNITY DATA:\n${sources}\n\nReturn JSON with keys: summary, noise_note, community_fingerprint {who_they_are, dominant_mood, awareness_stage, sophistication, data_appears}, signal_map [{signal, signal_type, frequency, prioritization_score, what_it_reveals}], sentiment_layers {surface, underlying, trust_level, emotional_drivers[]}, problems {explicit[], implicit[], fears[]}, readiness {community_momentum, ready_for[], not_ready_for[]}, action_orientation {community_engagement[], leadership_options[], preferred_format}, risk_signals [{risk, severity, what_it_means}], opportunity_map {content[], program[], product[], advocacy[], partnership[], resource[]}, lexicon [{phrase, signals}], supporting_resources [{title, source, url, relevance}]`;
 
     try {
-      const res = await fetch("/api/generate-report", {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ systemPrompt, userPrompt })
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, system: systemPrompt, messages: [{ role: "user", content: userPrompt }] })
       });
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => "");
-        throw new Error(`Report generation failed (${res.status}): ${errBody}`);
-      }
       const data = await res.json();
       const raw = data.content?.[0]?.text || "";
       const cleaned = raw.replace(/```json|```/g, "").trim();
@@ -2620,7 +2632,6 @@ export default function ECLIPPSApp() {
       setScreen("workspace"); setTab("report");
     } catch (e) {
       clearInterval(phaseTimer);
-      console.error("Report generation error:", e);
       setErr("Report generation encountered an error. Please check your sources and try again.");
       setScreen("error");
     }
